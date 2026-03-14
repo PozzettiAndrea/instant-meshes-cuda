@@ -1,7 +1,15 @@
-cmake_minimum_required (VERSION 2.8.3)
-project(InstantMeshes)
+cmake_minimum_required (VERSION 3.18)
 
+option(BUILD_CUDA "Build with CUDA acceleration" ON)
 option(INSTANT_MESHES_DEV_MODE "Instant meshes developer mode" OFF)
+
+if(BUILD_CUDA)
+  project(InstantMeshes LANGUAGES CXX C CUDA)
+  find_package(CUDAToolkit REQUIRED)
+  message(STATUS "CUDA found: ${CUDAToolkit_VERSION}")
+else()
+  project(InstantMeshes LANGUAGES CXX C)
+endif()
 
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   message(STATUS "Setting build type to 'Release' as none was specified.")
@@ -54,11 +62,11 @@ elseif(APPLE)
   #string(REGEX REPLACE "^.*X([0-9.]*).sdk$" "\\1" CMAKE_OSX_DEPLOYMENT_TARGET "${CMAKE_OSX_SYSROOT}")
 endif()
 
-# Enable C++11 mode on GCC / Clang
+# Enable C++14 mode on GCC / Clang (needed for CUDA interop)
 if (CMAKE_CXX_COMPILER_ID MATCHES "GNU")
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=gnu++11")
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=gnu++14")
 elseif (CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++11")
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++14")
 endif()
 
 # Build NanoGUI
@@ -110,6 +118,8 @@ include_directories(
   ${CMAKE_CURRENT_SOURCE_DIR}/ext/rply
   # Half precision type
   ${CMAKE_CURRENT_SOURCE_DIR}/ext/half
+  # Fast float parsing
+  ${CMAKE_CURRENT_SOURCE_DIR}/ext
   # Resource file
   ${CMAKE_CURRENT_BINARY_DIR}
 )
@@ -147,7 +157,7 @@ elseif(WIN32)
   set(EXTRA_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/resources/im.rc")
 endif()
 
-add_executable(InstantMeshes MACOSX_BUNDLE
+set(IMESH_SOURCES
   resources.cpp
   src/glutil.h src/glutil.cpp
   src/widgets.h src/widgets.cpp
@@ -169,8 +179,31 @@ add_executable(InstantMeshes MACOSX_BUNDLE
   src/smoothcurve.h src/smoothcurve.cpp
   src/cleanup.h src/cleanup.cpp
   src/dedge.h src/dedge.cpp
+  src/checkpoint.h src/checkpoint.cpp
   ext/rply/rply.c
   ${EXTRA_SOURCE})
+
+if(BUILD_CUDA)
+  list(APPEND IMESH_SOURCES
+    src/optimizer_cuda.h
+    src/optimizer_cuda.cu
+    src/init_kernels.h
+    src/init_kernels.cu)
+endif()
+
+add_executable(InstantMeshes MACOSX_BUNDLE ${IMESH_SOURCES})
+
+if(BUILD_CUDA)
+  target_compile_definitions(InstantMeshes PRIVATE WITH_CUDA)
+  set_target_properties(InstantMeshes PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+    CUDA_STANDARD 14)
+  # Set GPU architecture - native SASS compilation avoids PTX JIT issues
+  if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+    set_target_properties(InstantMeshes PROPERTIES CUDA_ARCHITECTURES "86")
+  endif()
+  target_link_libraries(InstantMeshes CUDA::cudart)
+endif()
 
 add_definitions(${NANOGUI_EXTRA_DEFS})
 target_link_libraries(InstantMeshes tbb_static nanogui ${NANOGUI_EXTRA_LIBS})
