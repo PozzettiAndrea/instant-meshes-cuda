@@ -11,6 +11,7 @@
 */
 
 #include <cuda_runtime.h>
+// cooperative_groups removed — persistent kernel caused code gen regression
 #include <cstdio>
 #include <cstring>
 #include <cmath>
@@ -378,85 +379,11 @@ __device__ void d_compat_pos_intrinsic_3(
 #define POS_EXT4  8
 #define POS_INT4  9
 
-// ============================================================
-// Orientation optimization kernel
-// ============================================================
-
-__global__ void kernel_optimize_orientations(
-    const uint32_t *phase_indices, uint32_t phase_size,
-    const uint32_t *adj_row, const uint32_t *adj_col, const float *adj_weight,
-    const float *N, const float *CQ, const float *CQw,
-    float *Q,
-    int orient_mode)
-{
-    uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= phase_size) return;
-
-    uint32_t i = phase_indices[tid];
-
-    float3 n_i = make_f3(N[i*3], N[i*3+1], N[i*3+2]);
-    float3 sum = make_f3(Q[i*3], Q[i*3+1], Q[i*3+2]);
-    float weight_sum = 0.0f;
-
-    uint32_t row_start = adj_row[i];
-    uint32_t row_end = adj_row[i+1];
-
-    for (uint32_t idx = row_start; idx < row_end; ++idx) {
-        uint32_t j = adj_col[idx];
-        float weight = adj_weight[idx];
-        if (weight == 0.0f) continue;
-
-        float3 n_j = make_f3(N[j*3], N[j*3+1], N[j*3+2]);
-        float3 q_j = make_f3(Q[j*3], Q[j*3+1], Q[j*3+2]);
-
-        float3 v0, v1;
-        switch (orient_mode) {
-            case ORIENT_EXT2: d_compat_orient_extrinsic_2(sum, n_i, q_j, n_j, v0, v1); break;
-            case ORIENT_INT2: d_compat_orient_intrinsic_2(sum, n_i, q_j, n_j, v0, v1); break;
-            case ORIENT_EXT4: d_compat_orient_extrinsic_4(sum, n_i, q_j, n_j, v0, v1); break;
-            case ORIENT_INT4: d_compat_orient_intrinsic_4(sum, n_i, q_j, n_j, v0, v1); break;
-            case ORIENT_EXT6: d_compat_orient_extrinsic_6(sum, n_i, q_j, n_j, v0, v1); break;
-            case ORIENT_INT6: d_compat_orient_intrinsic_6(sum, n_i, q_j, n_j, v0, v1); break;
-        }
-
-        sum = v0 * weight_sum + v1 * weight;
-        sum = sum - n_i * dot3(n_i, sum);
-        weight_sum += weight;
-
-        float n = norm3(sum);
-        if (n > 1e-38f) sum = sum * (1.0f / n);
-    }
-
-    // Apply constraints
-    if (CQw != nullptr && CQw[i] != 0.0f) {
-        float cw = CQw[i];
-        float3 cq = make_f3(CQ[i*3], CQ[i*3+1], CQ[i*3+2]);
-
-        float3 v0, v1;
-        switch (orient_mode) {
-            case ORIENT_EXT2: d_compat_orient_extrinsic_2(sum, n_i, cq, n_i, v0, v1); break;
-            case ORIENT_INT2: d_compat_orient_intrinsic_2(sum, n_i, cq, n_i, v0, v1); break;
-            case ORIENT_EXT4: d_compat_orient_extrinsic_4(sum, n_i, cq, n_i, v0, v1); break;
-            case ORIENT_INT4: d_compat_orient_intrinsic_4(sum, n_i, cq, n_i, v0, v1); break;
-            case ORIENT_EXT6: d_compat_orient_extrinsic_6(sum, n_i, cq, n_i, v0, v1); break;
-            case ORIENT_INT6: d_compat_orient_intrinsic_6(sum, n_i, cq, n_i, v0, v1); break;
-        }
-
-        sum = v0 * (1.0f - cw) + v1 * cw;
-        sum = sum - n_i * dot3(n_i, sum);
-        float n = norm3(sum);
-        if (n > 1e-38f) sum = sum * (1.0f / n);
-    }
-
-    if (weight_sum > 0.0f) {
-        Q[i*3]   = sum.x;
-        Q[i*3+1] = sum.y;
-        Q[i*3+2] = sum.z;
-    }
-}
+// Orient kernel REMOVED — orient runs on CPU (1.25 FLOP/byte, memory-bound,
+// CPU L3 >> GPU L2 for this access pattern). Only position runs on GPU.
 
 // ============================================================
-// Position optimization kernel
+// Position optimization kernel (GPU — higher arithmetic intensity)
 // ============================================================
 
 __global__ void kernel_optimize_positions(
@@ -533,28 +460,8 @@ __global__ void kernel_optimize_positions(
 }
 
 // ============================================================
-// Propagation kernel (coarse to fine)
+// Position propagation kernel (coarse to fine)
 // ============================================================
-
-__global__ void kernel_propagate_orient(
-    const float *src_Q, const uint32_t *toUpper, uint32_t nCoarse,
-    float *dst_Q, const float *dst_N)
-{
-    uint32_t j = blockIdx.x * blockDim.x + threadIdx.x;
-    if (j >= nCoarse) return;
-
-    float3 q = make_f3(src_Q[j*3], src_Q[j*3+1], src_Q[j*3+2]);
-
-    for (int k = 0; k < 2; ++k) {
-        uint32_t dest = toUpper[j*2 + k];
-        if (dest == 0xFFFFFFFFu) continue;
-        float3 n = make_f3(dst_N[dest*3], dst_N[dest*3+1], dst_N[dest*3+2]);
-        float3 result = q - n * dot3(n, q);
-        dst_Q[dest*3]   = result.x;
-        dst_Q[dest*3+1] = result.y;
-        dst_Q[dest*3+2] = result.z;
-    }
-}
 
 __global__ void kernel_propagate_pos(
     const float *src_O, const uint32_t *toUpper, uint32_t nCoarse,
@@ -776,27 +683,7 @@ void cuda_optimizer_upload(CUDAOptimizerContext* ctx,
     ctx->hier.allocated = true;
 }
 
-// Run orientation optimization on GPU for one level
-void cuda_optimize_orientations(CUDAOptimizerContext* ctx, int level) {
-    CUDAHierarchyLevel& lev = ctx->hier.levels[level];
-    const int BS = 256;
-
-    for (uint32_t p = 0; p < lev.d_phases.size(); ++p) {
-        uint32_t ps = lev.phase_sizes[p];
-        if (ps == 0) continue;
-        int grid = (ps + BS - 1) / BS;
-        kernel_optimize_orientations<<<grid, BS>>>(
-            lev.d_phases[p], ps,
-            lev.d_adj_row, lev.d_adj_col, lev.d_adj_weight,
-            lev.d_N, lev.d_CQ, lev.d_CQw,
-            lev.d_Q,
-            ctx->orient_mode);
-        cudaGetLastError();
-    }
-    cudaDeviceSynchronize();
-}
-
-// Run position optimization on GPU for one level
+// Run position optimization on GPU for one level (NO sync)
 void cuda_optimize_positions(CUDAOptimizerContext* ctx, int level) {
     CUDAHierarchyLevel& lev = ctx->hier.levels[level];
     const int BS = 256;
@@ -814,27 +701,9 @@ void cuda_optimize_positions(CUDAOptimizerContext* ctx, int level) {
             ctx->scale, ctx->inv_scale,
             ctx->pos_mode);
     }
-    cudaDeviceSynchronize();
 }
 
-// Propagate orientation field from coarse to fine
-// fine.d_toUpper stores mRes.toUpper(fine_level) which maps level fine_level+1 -> fine_level
-void cuda_propagate_orient(CUDAOptimizerContext* ctx, int fine_level) {
-    int coarse_level = fine_level + 1;
-    CUDAHierarchyLevel& coarse = ctx->hier.levels[coarse_level];
-    CUDAHierarchyLevel& fine = ctx->hier.levels[fine_level];
-
-    if (!fine.d_toUpper) return;
-
-    const int BS = 256;
-    int grid = (coarse.nVerts + BS - 1) / BS;
-    kernel_propagate_orient<<<grid, BS>>>(
-        coarse.d_Q, fine.d_toUpper, coarse.nVerts,
-        fine.d_Q, fine.d_N);
-    cudaDeviceSynchronize();
-}
-
-// Propagate position field from coarse to fine
+// Propagate position field from coarse to fine (NO sync)
 void cuda_propagate_pos(CUDAOptimizerContext* ctx, int fine_level) {
     int coarse_level = fine_level + 1;
     CUDAHierarchyLevel& coarse = ctx->hier.levels[coarse_level];
@@ -847,7 +716,6 @@ void cuda_propagate_pos(CUDAOptimizerContext* ctx, int fine_level) {
     kernel_propagate_pos<<<grid, BS>>>(
         coarse.d_O, fine.d_toUpper, coarse.nVerts,
         fine.d_O, fine.d_N, fine.d_V);
-    cudaDeviceSynchronize();
 }
 
 // Download Q field from GPU back to host
@@ -873,23 +741,9 @@ void cuda_download_all_fields(CUDAOptimizerContext* ctx,
     }
 }
 
-// Run full hierarchical orientation optimization (coarse to fine, 6 iterations per level)
-// Matches CPU Optimizer::run(): propagate only one level down after each level's iterations
-void cuda_optimize_orientations_full(CUDAOptimizerContext* ctx, int nLevels) {
-    const int levelIterations = 6;
+// Full hierarchical optimization: all levels, 6 iterations each, coarse to fine.
+// Orient removed — runs on CPU. Only position uses GPU.
 
-    for (int level = nLevels - 1; level >= 0; --level) {
-        for (int iter = 0; iter < levelIterations; ++iter) {
-            cuda_optimize_orientations(ctx, level);
-        }
-        // Propagate one level down (from current level to level-1)
-        if (level > 0) {
-            cuda_propagate_orient(ctx, level - 1);
-        }
-    }
-}
-
-// Run full hierarchical position optimization (coarse to fine, 6 iterations per level)
 void cuda_optimize_positions_full(CUDAOptimizerContext* ctx, int nLevels) {
     const int levelIterations = 6;
 
@@ -901,6 +755,7 @@ void cuda_optimize_positions_full(CUDAOptimizerContext* ctx, int nLevels) {
             cuda_propagate_pos(ctx, level - 1);
         }
     }
+    cudaDeviceSynchronize();
 }
 
 } // extern "C"

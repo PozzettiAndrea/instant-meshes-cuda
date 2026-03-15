@@ -182,25 +182,30 @@ compat_orientation_extrinsic_2(const Vector3f &q0, const Vector3f &n0,
 std::pair<Vector3f, Vector3f>
 compat_orientation_extrinsic_4(const Vector3f &q0, const Vector3f &n0,
                                const Vector3f &q1, const Vector3f &n1) {
-    const Vector3f A[2] = { q0, n0.cross(q0) };
-    const Vector3f B[2] = { q1, n1.cross(q1) };
+    // Branchless version — enables GCC/Clang auto-vectorization with -O3 -march=native
+    // All 4 scores computed unconditionally, max found via branchless comparisons
+    const Vector3f A0 = q0, A1 = n0.cross(q0);
+    const Vector3f B0 = q1, B1 = n1.cross(q1);
 
-    Float best_score = -std::numeric_limits<Float>::infinity();
-    int best_a = 0, best_b = 0;
+    const Float s00 = std::abs(A0.dot(B0));
+    const Float s01 = std::abs(A0.dot(B1));
+    const Float s10 = std::abs(A1.dot(B0));
+    const Float s11 = std::abs(A1.dot(B1));
 
-    for (int i = 0; i < 2; ++i) {
-        for (int j = 0; j < 2; ++j) {
-            Float score = std::abs(A[i].dot(B[j]));
-            if (score > best_score) {
-                best_a = i;
-                best_b = j;
-                best_score = score;
-            }
-        }
-    }
+    // Branchless max of 4 scores: s[a][b] where a indexes A, b indexes B
+    // Row max: best b for each a
+    const int b0 = s01 > s00 ? 1 : 0;  // best b for a=0
+    const int b1 = s11 > s10 ? 1 : 0;  // best b for a=1
+    const Float m0 = b0 ? s01 : s00;
+    const Float m1 = b1 ? s11 : s10;
+    const int best_a = m1 > m0 ? 1 : 0;
+    const int best_b = best_a ? b1 : b0;
 
-    const Float dp = A[best_a].dot(B[best_b]);
-    return std::make_pair(A[best_a], B[best_b] * signum(dp));
+    const Vector3f &bestA = best_a ? A1 : A0;
+    const Vector3f &bestB = best_b ? B1 : B0;
+
+    const Float dp = bestA.dot(bestB);
+    return std::make_pair(bestA, bestB * signum(dp));
 }
 
 std::pair<Vector3f, Vector3f>

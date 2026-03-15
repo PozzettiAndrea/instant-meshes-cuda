@@ -35,8 +35,10 @@ public:
 
     int levels() const { return (int) mV.size(); }
 
+    // coloring_mode: 0=exact (default), 1=random partition (k=16)
     void build(bool deterministic = false,
-               const ProgressCallback &progress = ProgressCallback());
+               const ProgressCallback &progress = ProgressCallback(),
+               int coloring_mode = 0);
 
     void printStatistics() const;
     void resetSolution();

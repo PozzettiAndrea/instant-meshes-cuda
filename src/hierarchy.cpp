@@ -206,6 +206,37 @@ AdjacencyMatrix downsample_graph(const AdjacencyMatrix adj, const MatrixXf &V,
     return adj_p;
 }
 
+void generate_random_partition(const AdjacencyMatrix &adj, uint32_t size,
+                               std::vector<std::vector<uint32_t>> &phases,
+                               int k,
+                               const ProgressCallback &progress) {
+    // Vivace-style randomized partitioning: assign each vertex to group hash(id) % k
+    // No graph coloring needed — O(N) time, trivially parallel
+    // Conflicts are rare: P(adjacent in same group) ≈ degree/N ≈ 0.01%
+    phases.clear();
+    phases.resize(k);
+    Timer<> timer;
+    cout << "    Random partition (k=" << k << ") .. ";
+    cout.flush();
+
+    // Pre-count for reserve
+    uint32_t shift = 0;
+    { int tmp = k; while (tmp > 1) { shift++; tmp >>= 1; } }  // log2(k)
+    std::vector<uint32_t> counts(k, 0);
+    for (uint32_t i = 0; i < size; ++i)
+        counts[((i * 2654435761u) >> (32 - shift)) % k]++;
+    for (int j = 0; j < k; ++j)
+        phases[j].reserve(counts[j]);
+
+    // Assign
+    for (uint32_t i = 0; i < size; ++i) {
+        uint32_t group = ((i * 2654435761u) >> (32 - shift)) % k;
+        phases[group].push_back(i);
+    }
+
+    cout << "done. (" << k << " groups, took " << timeString(timer.value()) << ")" << endl;
+}
+
 void generate_graph_coloring_deterministic(const AdjacencyMatrix &adj, uint32_t size,
                              std::vector<std::vector<uint32_t> > &phases,
                              const ProgressCallback &progress) {
@@ -410,15 +441,25 @@ MultiResolutionHierarchy::MultiResolutionHierarchy() {
     mFrozenO = mFrozenQ = false;
 }
 
-void MultiResolutionHierarchy::build(bool deterministic, const ProgressCallback &progress) {
+void MultiResolutionHierarchy::build(bool deterministic,
+                                     const ProgressCallback &progress,
+                                     int coloring_mode) {
+    auto do_coloring = [&](const AdjacencyMatrix &adj, uint32_t size,
+                           std::vector<std::vector<uint32_t>> &phases) {
+        if (coloring_mode == 1) {
+            generate_random_partition(adj, size, phases, 8, progress);
+        } else if (deterministic) {
+            generate_graph_coloring_deterministic(adj, size, phases, progress);
+        } else {
+            generate_graph_coloring(adj, size, phases, progress);
+        }
+    };
+
     std::vector<std::vector<uint32_t>> phases;
     cout << "Processing level 0 .." << endl;
-    if (deterministic)
-        generate_graph_coloring_deterministic(mAdj[0], mV[0].cols(), phases, progress);
-    else
-        generate_graph_coloring(mAdj[0], mV[0].cols(), phases, progress);
+    do_coloring(mAdj[0], mV[0].cols(), phases);
     mPhases.push_back(phases);
-    
+
     mTotalSize = mV[0].cols();
     mCO.push_back(MatrixXf());
     mCOw.push_back(VectorXf());
@@ -438,10 +479,7 @@ void MultiResolutionHierarchy::build(bool deterministic, const ProgressCallback 
             downsample_graph(mAdj[i], mV[i], mN[i], mA[i], V_p, N_p, A_p,
                              toUpper, toLower, deterministic, progress);
 
-        if (deterministic)
-            generate_graph_coloring_deterministic(adj_p, V_p.cols(), phases_p, progress);
-        else
-            generate_graph_coloring(adj_p, V_p.cols(), phases_p, progress);
+        do_coloring(adj_p, V_p.cols(), phases_p);
 
         mTotalSize += V_p.cols();
         mPhases.push_back(std::move(phases_p));

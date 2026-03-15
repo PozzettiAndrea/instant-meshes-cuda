@@ -186,9 +186,7 @@ set(IMESH_SOURCES
 if(BUILD_CUDA)
   list(APPEND IMESH_SOURCES
     src/optimizer_cuda.h
-    src/optimizer_cuda.cu
-    src/init_kernels.h
-    src/init_kernels.cu)
+    src/optimizer_cuda.cu)
 endif()
 
 add_executable(InstantMeshes MACOSX_BUNDLE ${IMESH_SOURCES})
@@ -196,7 +194,7 @@ add_executable(InstantMeshes MACOSX_BUNDLE ${IMESH_SOURCES})
 if(BUILD_CUDA)
   target_compile_definitions(InstantMeshes PRIVATE WITH_CUDA)
   set_target_properties(InstantMeshes PROPERTIES
-    CUDA_SEPARABLE_COMPILATION ON
+    CUDA_SEPARABLE_COMPILATION OFF
     CUDA_STANDARD 14)
   # Set GPU architecture - native SASS compilation avoids PTX JIT issues
   if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
