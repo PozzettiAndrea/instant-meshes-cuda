@@ -28,6 +28,10 @@
 #include "optimizer_cuda.h"
 #endif
 
+#ifdef WITH_RXMESH
+#include "rxmesh_subdivide.h"
+#endif
+
 #if 0  // GPU-resident path disabled — caused device linking performance regression
 #include "gpu_hierarchy.h"
 #include "subdivide_gpu.h"
@@ -362,7 +366,53 @@ void batch_process(const BatchOptions &opts) {
                 build_dedge(F, V, V2E, E2E, boundary, nonManifold);
                 Float maxLen = std::min(scale/2, (Float) stats.mAverageEdgeLength*2);
 
-                // GPU subdivision disabled (see subdivide_gpu.cu for reference impl)
+#ifdef WITH_RXMESH
+                if (opts.hierarchy_strategy == 1) {
+                    // GPU edge splitting via RXMesh cavity operator
+                    Timer<> rx_timer;
+                    cout << "GPU subdivision (RXMesh) .. ";
+                    cout.flush();
+
+                    // Flatten F,V for C interface
+                    uint32_t nV_in = V.cols(), nF_in = F.cols();
+                    std::vector<float> V_flat(nV_in * 3);
+                    std::vector<uint32_t> F_flat(nF_in * 3);
+                    for (uint32_t i = 0; i < nV_in; ++i) {
+                        V_flat[i*3+0] = V(0,i);
+                        V_flat[i*3+1] = V(1,i);
+                        V_flat[i*3+2] = V(2,i);
+                    }
+                    for (uint32_t i = 0; i < nF_in; ++i) {
+                        F_flat[i*3+0] = F(0,i);
+                        F_flat[i*3+1] = F(1,i);
+                        F_flat[i*3+2] = F(2,i);
+                    }
+
+                    float *V_out = nullptr; uint32_t nV_out = 0;
+                    uint32_t *F_out = nullptr; uint32_t nF_out = 0;
+                    rxmesh_subdivide(V_flat.data(), nV_in, F_flat.data(), nF_in,
+                                     (float)maxLen, &V_out, &nV_out, &F_out, &nF_out);
+
+                    // Copy back into Eigen matrices
+                    V.resize(3, nV_out);
+                    F.resize(3, nF_out);
+                    for (uint32_t i = 0; i < nV_out; ++i) {
+                        V(0,i) = V_out[i*3+0];
+                        V(1,i) = V_out[i*3+1];
+                        V(2,i) = V_out[i*3+2];
+                    }
+                    for (uint32_t i = 0; i < nF_out; ++i) {
+                        F(0,i) = F_out[i*3+0];
+                        F(1,i) = F_out[i*3+1];
+                        F(2,i) = F_out[i*3+2];
+                    }
+                    free(V_out); free(F_out);
+
+                    cout << nV_in << " -> " << nV_out << " verts, "
+                         << nF_in << " -> " << nF_out << " faces. "
+                         << "(took " << timeString(rx_timer.value()) << ")" << endl;
+                } else
+#endif
                 {
                     subdivide(F, V, V2E, E2E, boundary, nonManifold, maxLen, opts.deterministic);
                 }

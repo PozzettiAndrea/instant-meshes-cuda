@@ -183,6 +183,8 @@ set(IMESH_SOURCES
   ext/rply/rply.c
   ${EXTRA_SOURCE})
 
+option(BUILD_RXMESH "Build with RXMesh GPU subdivision" OFF)
+
 if(BUILD_CUDA)
   list(APPEND IMESH_SOURCES
     src/optimizer_cuda.h
@@ -195,7 +197,29 @@ if(BUILD_CUDA)
   target_compile_definitions(InstantMeshes PRIVATE WITH_CUDA)
   set_target_properties(InstantMeshes PROPERTIES
     CUDA_SEPARABLE_COMPILATION OFF
-    CUDA_STANDARD 14)
+    CUDA_STANDARD 17)
+
+  if(BUILD_RXMESH)
+    # RXMesh is vendored in ext/rxmesh but compiled separately to avoid Eigen
+    # version conflicts with nanogui's bundled Eigen 3.2.
+    # Run: scripts/build_rxmesh.sh [CUDA_PATH] [ARCH]
+    # This produces build/rxmesh/{libRXMesh.a, rxmesh_subdivide.o, rxmesh_dlink.o, ...}
+    set(RXMESH_BUILD_DIR "${CMAKE_CURRENT_SOURCE_DIR}/build/rxmesh")
+    if(NOT EXISTS "${RXMESH_BUILD_DIR}/libRXMesh.a")
+      message(FATAL_ERROR
+        "RXMesh not built. Run: scripts/build_rxmesh.sh\n"
+        "Expected: ${RXMESH_BUILD_DIR}/libRXMesh.a")
+    endif()
+    target_compile_definitions(InstantMeshes PRIVATE WITH_RXMESH)
+    find_package(OpenMP REQUIRED)
+    target_link_libraries(InstantMeshes
+      "${RXMESH_BUILD_DIR}/rxmesh_subdivide.o"
+      "${RXMESH_BUILD_DIR}/rxmesh_dlink.o"
+      "${RXMESH_BUILD_DIR}/libRXMesh.a"
+      "${RXMESH_BUILD_DIR}/libmetis.a"
+      "${RXMESH_BUILD_DIR}/libGKlib.a"
+      CUDA::cusparse CUDA::cublas OpenMP::OpenMP_CXX)
+  endif()
   # Set GPU architecture - native SASS compilation avoids PTX JIT issues
   if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
     set_target_properties(InstantMeshes PROPERTIES CUDA_ARCHITECTURES "86")

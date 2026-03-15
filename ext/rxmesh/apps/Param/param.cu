@@ -1,0 +1,375 @@
+// Reference Implementation
+// https://github.com/patr-schm/TinyAD-Examples/blob/main/apps/parametrization_openmesh.cc
+#include <CLI/CLI.hpp>
+#include <cstdlib>
+
+#include "rxmesh/rxmesh_static.h"
+
+#include "rxmesh/algo/tutte_embedding.h"
+
+#include "rxmesh/diff/diff_scalar_problem.h"
+#include "rxmesh/diff/newton_solver.h"
+#include "rxmesh/util/log.h"
+
+
+struct arg
+{
+    std::string obj_file_name   = STRINGIFY(INPUT_DIR) "bunnyhead.obj";
+    std::string output_folder   = STRINGIFY(OUTPUT_DIR);
+    std::string uv_file_name    = "";
+    std::string solver          = "cudss_chol";
+    uint32_t    device_id       = 0;
+    float       cg_abs_tol      = 1e-6;
+    float       cg_rel_tol      = 0.0;
+    uint32_t    cg_max_iter     = 10;
+    uint32_t    newton_max_iter = 100;
+    char**      argv;
+    int         argc;
+} Arg;
+
+
+using namespace rxmesh;
+
+
+template <typename T>
+void add_mesh_to_polyscope(RXMeshStatic&       rx,
+                           VertexAttribute<T>& v,
+                           std::string         name)
+{
+#if USE_POLYSCOPE
+    if (v.get_num_attributes() == 3) {
+        polyscope::registerSurfaceMesh(name, v, rx.get_polyscope_mesh()->faces);
+    } else {
+        auto v3 = *rx.add_vertex_attribute<T>(name, 3);
+
+        rx.for_each_vertex(HOST, [&](const VertexHandle h) {
+            v3(h, 0) = v(h, 0);
+            v3(h, 1) = v(h, 1);
+            v3(h, 2) = 0;
+        });
+
+        polyscope::registerSurfaceMesh(
+            name, v3, rx.get_polyscope_mesh()->faces);
+
+        rx.remove_attribute(name);
+    }
+#endif
+}
+
+template <typename T, typename ProblemT, typename SolverT>
+void parameterize(RXMeshStatic& rx, ProblemT& problem, SolverT& solver)
+{
+    NetwtonSolver newton_solver(problem, &solver);
+
+    auto coordinates = *rx.get_input_vertex_coordinates();
+
+    // TODO this is a AoS and should be converted into SoA
+    auto rest_shape =
+        *rx.add_face_attribute<Eigen::Matrix<T, 2, 2>>("fRestShape", 1);
+
+    if (Arg.uv_file_name.empty()) {
+        tutte_embedding(rx, coordinates, *problem.objective);
+    } else {
+        std::vector<std::vector<uint32_t>> fv;
+        std::vector<std::vector<float>>    uv;
+        import_obj(Arg.uv_file_name, uv, fv);
+        if (uv.size() != rx.get_num_vertices()) {
+            RXMESH_ERROR(
+                "Number of vertices in the the input UV file {} does not match "
+                "the number of vertices in the mesh {}.",
+                uv.size(),
+                rx.get_num_vertices());
+        }
+        rx.for_each_vertex(HOST, [&](const VertexHandle vh) {
+            uint32_t id = rx.map_to_global(vh);
+
+            (*problem.objective)(vh, 0) = uv[id][0];
+            (*problem.objective)(vh, 1) = uv[id][1];
+        });
+
+        problem.objective->move(HOST, DEVICE);
+    }
+
+#if USE_POLYSCOPE
+    rx.get_polyscope_mesh()->addVertexParameterizationQuantity(
+        "uv_tutte", *problem.objective);
+
+    auto bnd = *rx.add_vertex_attribute<bool>("Bnd", 1);
+    rx.get_boundary_vertices(bnd);
+    rx.get_polyscope_mesh()->addVertexScalarQuantity("Boundary", bnd);
+
+    add_mesh_to_polyscope(rx, *problem.objective, "tutte_mesh");
+#endif
+
+    constexpr uint32_t blockThreads = 256;
+
+    // 1) compute rest shape
+    rx.run_query_kernel<Op::FV, blockThreads>(
+        [=] __device__(const FaceHandle& fh, const VertexIterator& iter) {
+            const VertexHandle v0 = iter[0];
+            const VertexHandle v1 = iter[1];
+            const VertexHandle v2 = iter[2];
+
+            assert(v0.is_valid() && v1.is_valid() && v2.is_valid());
+
+            // 3d position
+            Eigen::Vector3<T> ar_3d = coordinates.to_eigen<3>(v0);
+            Eigen::Vector3<T> br_3d = coordinates.to_eigen<3>(v1);
+            Eigen::Vector3<T> cr_3d = coordinates.to_eigen<3>(v2);
+
+            // Local 2D coordinate system
+            Eigen::Vector3<T> n  = (br_3d - ar_3d).cross(cr_3d - ar_3d);
+            Eigen::Vector3<T> b1 = (br_3d - ar_3d).normalized();
+            Eigen::Vector3<T> b2 = n.cross(b1).normalized();
+
+            // Express a, b, c in local 2D coordinates system
+            Eigen::Vector2<T> ar_2d(T(0.0), T(0.0));
+            Eigen::Vector2<T> br_2d((br_3d - ar_3d).dot(b1), T(0.0));
+            Eigen::Vector2<T> cr_2d((cr_3d - ar_3d).dot(b1),
+                                    (cr_3d - ar_3d).dot(b2));
+
+            // Save 2-by-2 matrix with edge vectors as columns
+            Eigen::Matrix<T, 2, 2> fout = col_mat(br_2d - ar_2d, cr_2d - ar_2d);
+
+            rest_shape(fh) = fout;
+        });
+
+
+    // add energy term
+    problem.template add_term<Op::FV, true>(
+        [=] __device__(const auto& fh, const auto& iter, auto& objective) {
+            // fh is a face handle
+            // iter is an iterator over fh's vertices
+            // objective is the uv coordinates
+
+            assert(iter[0].is_valid() && iter[1].is_valid() &&
+                   iter[2].is_valid());
+
+            assert(iter.size() == 3);
+
+            using ActiveT = ACTIVE_TYPE(fh);
+
+            // uv
+            Eigen::Vector2<ActiveT> a =
+                iter_val<ActiveT, 2>(fh, iter, objective, 0);
+            Eigen::Vector2<ActiveT> b =
+                iter_val<ActiveT, 2>(fh, iter, objective, 1);
+            Eigen::Vector2<ActiveT> c =
+                iter_val<ActiveT, 2>(fh, iter, objective, 2);
+
+
+            // Triangle flipped?
+            Eigen::Matrix<ActiveT, 2, 2> M = col_mat(b - a, c - a);
+
+            if (M.determinant() <= 0.0) {
+                using PassiveT = PassiveType<ActiveT>;
+                return ActiveT(std::numeric_limits<PassiveT>::max());
+            }
+
+            // Get constant 2D rest shape and area of triangle t
+            const Eigen::Matrix<T, 2, 2> Mr = rest_shape(fh);
+
+            const T A = T(0.5) * Mr.determinant();
+
+            // Compute symmetric Dirichlet energy
+            Eigen::Matrix<ActiveT, 2, 2> J = M * Mr.inverse();
+
+            ActiveT res = A * (J.squaredNorm() + J.inverse().squaredNorm());
+
+
+            return res;
+        });
+
+
+    T convergence_eps = 1e-2;
+
+    int iter;
+
+    Timers<GPUTimer> timer;
+    timer.add("Total");
+    timer.add("DiffCG");
+    timer.add("LineSearch");
+
+    timer.start("Total");
+
+    int num_cg_iter = 1;
+
+    for (iter = 0; iter < Arg.newton_max_iter; ++iter) {
+
+        timer.start("DiffCG");
+
+        if (Arg.solver == "cg_mat_free") {
+            // calc gradient only if we are using matrix free solver
+            problem.eval_terms_grad_only();
+        } else {
+            // calc loss function
+            problem.eval_terms();
+        }
+
+
+        // get the current value of the loss function
+        // T f = problem.get_current_loss();
+        // RXMESH_INFO("Iteration= {}: Energy = {}", iter, f);
+
+        // direction newton
+        newton_solver.compute_direction();
+        timer.stop("DiffCG");
+
+        if constexpr (std::is_base_of_v<
+                          CGSolver<T, ProblemT::DenseMatT::OrderT>,
+                          SolverT>) {
+            num_cg_iter += solver.iter_taken();
+        }
+
+        // newton decrement
+        if (0.5f * problem.grad.dot(newton_solver.dir) < convergence_eps) {
+            break;
+        }
+
+        // line search
+        timer.start("LineSearch");
+        newton_solver.line_search();
+        timer.stop("LineSearch");
+    }
+
+    timer.stop("Total");
+
+
+    RXMESH_INFO(
+        "Parametrization: iterations ={}, num_cg_iter= {}, time= {} (ms), "
+        "timer/iteration= {} ms/iter, diff_cg_time/iter = {}, line_search/iter "
+        "= {}, diff_cg_time/iter/cg_iter = {}",
+        iter,
+        num_cg_iter,
+        timer.elapsed_millis("Total"),
+        timer.elapsed_millis("Total") / float(iter),
+        timer.elapsed_millis("DiffCG") / float(iter),
+        timer.elapsed_millis("LineSearch") / float(iter),
+        timer.elapsed_millis("DiffCG") / float(iter * num_cg_iter));
+
+
+    problem.objective->move(DEVICE, HOST);
+
+#if USE_POLYSCOPE
+    rx.get_polyscope_mesh()->addVertexParameterizationQuantity(
+        "uv_opt", *problem.objective);
+
+    add_mesh_to_polyscope(rx, *problem.objective, "opt_mesh");
+
+    polyscope::show();
+#endif
+}
+
+int main(int argc, char** argv)
+{
+    using T = float;
+
+    CLI::App app{
+        "Param - Mesh parametrization using symmetric Dirichlet energy"};
+
+    app.add_option("-i,--input", Arg.obj_file_name, "Input OBJ mesh file")
+        ->default_val(std::string(STRINGIFY(INPUT_DIR) "bunnyhead.obj"));
+
+    app.add_option("--uv",
+                   Arg.uv_file_name,
+                   "Input UV OBJ file (if empty, will compute tutte embedding)")
+        ->default_val(std::string(""));
+
+    app.add_option("-o,--output", Arg.output_folder, "JSON file output folder")
+        ->default_val(std::string(STRINGIFY(OUTPUT_DIR)));
+
+    app.add_option("-s,--solver", Arg.solver, "Solver to use")
+        ->default_val(std::string("cudss_chol"))
+        ->check(CLI::IsMember(
+            {"cg_mat_free", "cg", "pcg", "chol", "cudss_chol", "lu"}));
+
+    app.add_option(
+           "--abs_eps", Arg.cg_abs_tol, "Iterative solvers absolute tolerance")
+        ->default_val(1e-6f);
+
+    app.add_option(
+           "--rel_eps", Arg.cg_rel_tol, "Iterative solvers relative tolerance")
+        ->default_val(0.0f);
+
+    app.add_option("--cg_max_iter",
+                   Arg.cg_max_iter,
+                   "Maximum number of iterations for iterative solvers")
+        ->default_val(10u);
+
+    app.add_option("--newton_max_iter",
+                   Arg.newton_max_iter,
+                   "Maximum number of iterations for Newton solver")
+        ->default_val(100u);
+
+    app.add_option("-d,--device_id", Arg.device_id, "GPU device ID")
+        ->default_val(0u);
+
+    try {
+        app.parse(argc, argv);
+    } catch (const CLI::ParseError& e) {
+        return app.exit(e);
+    }
+
+    rx_init(Arg.device_id);
+
+    Arg.argv = argv;
+    Arg.argc = argc;
+
+    RXMESH_INFO("input= {}", Arg.obj_file_name);
+    RXMESH_INFO("uv_file= {}", Arg.uv_file_name);
+    RXMESH_INFO("output_folder= {}", Arg.output_folder);
+    RXMESH_INFO("solver= {}", Arg.solver);
+    RXMESH_INFO("cg_max_iter= {}", Arg.cg_max_iter);
+    RXMESH_INFO("newton_max_iter= {}", Arg.newton_max_iter);
+    RXMESH_INFO("abs_eps= {0:f}", Arg.cg_abs_tol);
+    RXMESH_INFO("rel_eps= {0:f}", Arg.cg_rel_tol);
+    RXMESH_INFO("device_id= {}", Arg.device_id);
+
+    RXMeshStatic rx(Arg.obj_file_name);
+
+    if (rx.is_closed()) {
+        RXMESH_ERROR(
+            "The input mesh is closed. The input mesh should have boundaries.");
+        return EXIT_FAILURE;
+    }
+
+    constexpr int VariableDim = 2;
+
+    using ProblemT = DiffScalarProblem<T, VariableDim, VertexHandle, true>;
+
+    bool assmble_hessian = Arg.solver != "cg_mat_free";
+
+    ProblemT problem(rx, assmble_hessian);
+
+    using HessMatT      = typename ProblemT::HessMatT;
+    constexpr int Order = ProblemT::DenseMatT::OrderT;
+
+    if (Arg.solver == "chol") {
+        CholeskySolver<HessMatT, Order> solver(problem.hess.get());
+        parameterize<T>(rx, problem, solver);
+#ifdef USE_CUDSS
+    } else if (Arg.solver == "cudss_chol") {
+        cuDSSCholeskySolver<HessMatT, Order> solver(problem.hess.get());
+        parameterize<T>(rx, problem, solver);
+#endif
+    } else if (Arg.solver == "lu") {
+        LUSolver<HessMatT, Order> solver(problem.hess.get());
+        parameterize<T>(rx, problem, solver);
+    } else if (Arg.solver == "cg") {
+        CGSolver<T, Order> solver(
+            *problem.hess, 1, Arg.cg_max_iter, Arg.cg_abs_tol, Arg.cg_rel_tol);
+        parameterize<T>(rx, problem, solver);
+    } else if (Arg.solver == "pcg") {
+        PCGSolver<T, Order> solver(
+            *problem.hess, 1, Arg.cg_max_iter, Arg.cg_abs_tol, Arg.cg_rel_tol);
+        parameterize<T>(rx, problem, solver);
+    } else if (Arg.solver == "cg_mat_free") {
+        int num_rows = VariableDim * rx.get_num_vertices();
+
+        CGMatFreeSolver<T, Order> solver(
+            num_rows, 1, Arg.cg_max_iter, Arg.cg_abs_tol, Arg.cg_rel_tol);
+        parameterize<T>(rx, problem, solver);
+    }
+
+    return 0;
+}

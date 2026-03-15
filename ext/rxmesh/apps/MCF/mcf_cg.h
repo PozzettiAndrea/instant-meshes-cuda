@@ -1,0 +1,143 @@
+#pragma once
+#include "rxmesh/rxmesh_static.h"
+#include "rxmesh/util/report.h"
+#include "rxmesh/util/timer.h"
+
+#include "rxmesh/matrix/cg_solver.h"
+#include "rxmesh/matrix/pcg_solver.h"
+
+#include "mcf_kernels.cuh"
+
+
+template <typename T, typename SolverT>
+void run_cg(rxmesh::RXMeshStatic& rx, bool pcg = false)
+{
+    using namespace rxmesh;
+    constexpr uint32_t blockThreads = 256;
+
+    uint32_t num_vertices = rx.get_num_vertices();
+
+    auto coords = rx.get_input_vertex_coordinates();
+
+    SparseMatrix<float> A_mat(rx);
+    DenseMatrix<float>  B_mat(rx, num_vertices, 3, LOCATION_ALL);
+
+    DenseMatrix<float> X_mat = *coords->to_matrix();
+
+    // B set up
+    rx.run_kernel<blockThreads>({Op::VV},
+                                mcf_B_setup<float, blockThreads>,
+                                *coords,
+                                B_mat,
+                                Arg.use_uniform_laplace);
+
+    // A set up
+    rx.run_kernel<blockThreads>({Op::VV},
+                                mcf_A_setup<float, blockThreads>,
+                                *coords,
+                                A_mat,
+                                Arg.use_uniform_laplace,
+                                Arg.time_step);
+
+    Report report("MCF_CG");
+    report.command_line(Arg.argc, Arg.argv);
+    report.device();
+    report.system();
+    report.model_data(Arg.obj_file_name, rx);
+    if (pcg)
+        report.add_member("method", std::string("PCG"));
+    else
+        report.add_member("method", std::string("CG"));
+    report.add_member("application", std::string("MCF"));
+    report.add_member("blockThreads", blockThreads);
+
+
+    float total_time = 0;
+
+    SolverT solver(
+        A_mat, X_mat.cols(), Arg.max_num_iter, Arg.tol_abs, Arg.tol_rel);
+
+
+    GPUTimer gtimer;
+    CPUTimer timer;
+
+    gtimer.start();
+    timer.start();
+
+    solver.pre_solve(B_mat, X_mat);
+
+    gtimer.stop();
+    timer.stop();
+
+    report.add_member(
+        "pre-solve", std::max(timer.elapsed_millis(), gtimer.elapsed_millis()));
+    total_time += std::max(timer.elapsed_millis(), gtimer.elapsed_millis());
+
+    timer.start();
+    gtimer.start();
+
+    solver.solve(B_mat, X_mat);
+
+    timer.stop();
+    gtimer.stop();
+
+    report.add_member(
+        "solve", std::max(timer.elapsed_millis(), gtimer.elapsed_millis()));
+    total_time += std::max(timer.elapsed_millis(), gtimer.elapsed_millis());
+
+    report.add_member("total_time", total_time);
+
+
+    CUDA_ERROR(cudaDeviceSynchronize());
+    CUDA_ERROR(cudaProfilerStop());
+
+    RXMESH_INFO("start_residual {}", solver.start_residual());
+    RXMESH_INFO("final_residual {}", solver.final_residual());
+    RXMESH_INFO("solver {} took {} (ms) and {} iterations (i.e., {} ms/iter)",
+                solver.name(),
+                timer.elapsed_millis(),
+                solver.iter_taken(),
+                timer.elapsed_millis() / float(solver.iter_taken()));
+
+    report.add_member("start_residual", solver.start_residual());
+    report.add_member("final_residual", solver.final_residual());
+    report.add_member("num_iterations", solver.iter_taken());
+    report.add_member("avg iteration time",
+                      timer.elapsed_millis() / float(solver.iter_taken()));
+
+    X_mat.move(rxmesh::DEVICE, rxmesh::HOST);
+
+
+    coords->from_matrix(&X_mat);
+
+#if USE_POLYSCOPE
+    polyscope::registerSurfaceMesh("old mesh",
+                                   rx.get_polyscope_mesh()->vertices,
+                                   rx.get_polyscope_mesh()->faces);
+    rx.get_polyscope_mesh()->updateVertexPositions(*coords);
+    polyscope::show();
+#endif
+
+    B_mat.release();
+    X_mat.release();
+    A_mat.release();
+
+    report.write(Arg.output_folder + "/rxmesh",
+                 "MCF_" + solver.name() + extract_file_name(Arg.obj_file_name));
+}
+
+template <typename T>
+void mcf_cg(rxmesh::RXMeshStatic& rx)
+{
+    using namespace rxmesh;
+
+    run_cg<T, CGSolver<T>>(rx);
+}
+
+template <typename T>
+void mcf_pcg(rxmesh::RXMeshStatic& rx)
+{
+    using namespace rxmesh;
+
+    run_cg<T, PCGSolver<T>>(rx, true);
+}
