@@ -52,6 +52,7 @@ void cuda_propagate_pos(CUDAOptimizerContext* ctx, int fine_level);
 // Full hierarchical optimization (coarse-to-fine, 6 iterations per level)
 void cuda_optimize_orientations_full(CUDAOptimizerContext* ctx, int nLevels);
 void cuda_optimize_positions_full(CUDAOptimizerContext* ctx, int nLevels);
+void cuda_optimize_positions_penner(CUDAOptimizerContext* ctx, int nLevels);
 
 // Download fields back to host
 void cuda_download_Q(CUDAOptimizerContext* ctx, int level, float *Q_host);

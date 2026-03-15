@@ -177,8 +177,12 @@ static void cuda_run_optimization(MultiResolutionHierarchy &mRes,
         rosy, posy, extrinsic, mRes.scale());
 
     // Orient removed from GPU — runs on CPU (memory-bound, CPU L3 > GPU L2)
-    // Only position runs on GPU (higher arithmetic intensity)
+    // Only position runs on GPU
     if (do_position) {
+        // Penner-inspired kernel tested but quality too poor (43% vs 92% quads).
+        // Full Penner approach needs edge-length optimization + Ptolemy flips + integer LP.
+        // Simplified Jacobi+snap doesn't maintain integer grid alignment.
+        // Reverting to standard Gauss-Seidel phase-based position optimization.
         cuda_optimize_positions_full(ctx, nLevels);
     }
 
